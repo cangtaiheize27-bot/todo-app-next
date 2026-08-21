@@ -1,31 +1,33 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-
-const STORAGE_KEY = "todo-app:v1";
-
-function loadTodos() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function newId() {
-  if (typeof crypto !== "undefined" && crypto.randomUUID) {
-    return crypto.randomUUID();
-  }
-  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
+import { useEffect, useMemo, useRef, useState } from "react";
+import TodoItem from "./components/TodoItem";
+import StatsBar from "./components/StatsBar";
+import Toolbar from "./components/Toolbar";
+import {
+  STORAGE_KEY,
+  PRIORITIES,
+  loadTodos,
+  newId,
+  normalizeTodo,
+  nextDueDate,
+  sortTodos,
+  filterTodos,
+  uniqueCategories,
+} from "./lib/todo-utils";
 
 export default function Home() {
   const [todos, setTodos] = useState([]);
   const [input, setInput] = useState("");
-  const [filter, setFilter] = useState("all"); // all | active | completed
+  const [newPriority, setNewPriority] = useState("medium");
+  const [newCategory, setNewCategory] = useState("");
+  const [newDueDate, setNewDueDate] = useState("");
+
+  const [status, setStatus] = useState("all"); // all | active | completed
+  const [category, setCategory] = useState("all");
+  const [sortKey, setSortKey] = useState("created");
+  const [search, setSearch] = useState("");
+
   const [mounted, setMounted] = useState(false);
   const [recentlyDeleted, setRecentlyDeleted] = useState(null); // { item, index }
 
@@ -56,9 +58,17 @@ export default function Home() {
   function addTodo() {
     const text = input.trim();
     if (!text) return; // 空文字は追加しない
-    const todo = { id: newId(), text, completed: false };
+    const todo = normalizeTodo({
+      text,
+      priority: newPriority,
+      category: newCategory.trim(),
+      dueDate: newDueDate || null,
+    });
     setTodos((prev) => [todo, ...prev]);
     setInput("");
+    setNewPriority("medium");
+    setNewCategory("");
+    setNewDueDate("");
     inputRef.current?.focus(); // 追加後もすぐ次を入力できるように
   }
 
@@ -70,9 +80,30 @@ export default function Home() {
   }
 
   function toggleTodo(id) {
-    setTodos((prev) =>
-      prev.map((t) => (t.id === id ? { ...t, completed: !t.completed } : t))
-    );
+    setTodos((prev) => {
+      const target = prev.find((t) => t.id === id);
+      if (!target) return prev;
+      const willComplete = !target.completed;
+      const updated = prev.map((t) =>
+        t.id === id ? { ...t, completed: willComplete } : t
+      );
+
+      // 繰り返しタスクを完了させたら、次回分を自動で追加する
+      if (willComplete && target.recurrence !== "none" && target.dueDate) {
+        const nextDue = nextDueDate(target.dueDate, target.recurrence);
+        const spawned = normalizeTodo({
+          text: target.text,
+          priority: target.priority,
+          category: target.category,
+          dueDate: nextDue,
+          tags: target.tags,
+          recurrence: target.recurrence,
+          subtasks: target.subtasks.map((s) => ({ text: s.text, completed: false })),
+        });
+        return [spawned, ...updated];
+      }
+      return updated;
+    });
   }
 
   function deleteTodo(id) {
@@ -102,13 +133,54 @@ export default function Home() {
     setTodos((prev) => prev.filter((t) => !t.completed));
   }
 
+  function saveTodo(id, patch) {
+    setTodos((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
+  }
+
+  function addSubtask(id, text) {
+    setTodos((prev) =>
+      prev.map((t) =>
+        t.id === id
+          ? { ...t, subtasks: [...t.subtasks, { id: newId(), text, completed: false }] }
+          : t
+      )
+    );
+  }
+
+  function toggleSubtask(id, subId) {
+    setTodos((prev) =>
+      prev.map((t) =>
+        t.id === id
+          ? {
+              ...t,
+              subtasks: t.subtasks.map((s) =>
+                s.id === subId ? { ...s, completed: !s.completed } : s
+              ),
+            }
+          : t
+      )
+    );
+  }
+
+  function deleteSubtask(id, subId) {
+    setTodos((prev) =>
+      prev.map((t) =>
+        t.id === id
+          ? { ...t, subtasks: t.subtasks.filter((s) => s.id !== subId) }
+          : t
+      )
+    );
+  }
+
   const activeCount = todos.filter((t) => !t.completed).length;
   const completedCount = todos.length - activeCount;
   const progress = todos.length === 0 ? 0 : Math.round((completedCount / todos.length) * 100);
+  const categories = useMemo(() => uniqueCategories(todos), [todos]);
 
-  const visible = todos.filter((t) =>
-    filter === "active" ? !t.completed : filter === "completed" ? t.completed : true
-  );
+  const visible = useMemo(() => {
+    const filtered = filterTodos(todos, { status, category, search });
+    return sortTodos(filtered, sortKey);
+  }, [todos, status, category, search, sortKey]);
 
   return (
     <main className="page">
@@ -124,6 +196,8 @@ export default function Home() {
             <div className="progress-bar" style={{ width: `${progress}%` }} />
           </div>
         </header>
+
+        {mounted && todos.length > 0 && <StatsBar todos={todos} />}
 
         <div className="composer">
           <input
@@ -146,23 +220,54 @@ export default function Home() {
           </button>
         </div>
 
-        {todos.length > 0 && (
-          <nav className="filters" aria-label="表示の絞り込み">
-            {[
-              { key: "all", label: "すべて" },
-              { key: "active", label: "未完了" },
-              { key: "completed", label: "完了" },
-            ].map((f) => (
-              <button
-                key={f.key}
-                className={`filter ${filter === f.key ? "is-active" : ""}`}
-                onClick={() => setFilter(f.key)}
-                aria-pressed={filter === f.key}
-              >
-                {f.label}
-              </button>
+        <div className="composer-details">
+          <select
+            className="composer-select"
+            value={newPriority}
+            onChange={(e) => setNewPriority(e.target.value)}
+            aria-label="新しいタスクの重要度"
+          >
+            {PRIORITIES.map((p) => (
+              <option key={p.value} value={p.value}>
+                重要度: {p.label}
+              </option>
             ))}
-          </nav>
+          </select>
+          <input
+            className="composer-select"
+            type="text"
+            list="category-suggestions"
+            value={newCategory}
+            onChange={(e) => setNewCategory(e.target.value)}
+            placeholder="カテゴリ（任意）"
+            aria-label="新しいタスクのカテゴリ"
+          />
+          <input
+            className="composer-select"
+            type="date"
+            value={newDueDate}
+            onChange={(e) => setNewDueDate(e.target.value)}
+            aria-label="新しいタスクの期日"
+          />
+        </div>
+        <datalist id="category-suggestions">
+          {categories.map((c) => (
+            <option key={c} value={c} />
+          ))}
+        </datalist>
+
+        {todos.length > 0 && (
+          <Toolbar
+            status={status}
+            onStatusChange={setStatus}
+            sortKey={sortKey}
+            onSortChange={setSortKey}
+            category={category}
+            onCategoryChange={setCategory}
+            categories={categories}
+            search={search}
+            onSearchChange={setSearch}
+          />
         )}
 
         <section className="list-area">
@@ -170,30 +275,21 @@ export default function Home() {
             // 読み込み前は空状態を先に見せない（ちらつき防止）
             <div className="placeholder" />
           ) : visible.length === 0 ? (
-            <EmptyState todosLength={todos.length} filter={filter} />
+            <EmptyState todosLength={todos.length} filter={status} />
           ) : (
             <ul className="list">
               {visible.map((t) => (
-                <li key={t.id} className={`item ${t.completed ? "is-done" : ""}`}>
-                  <label className="check">
-                    <input
-                      type="checkbox"
-                      checked={t.completed}
-                      onChange={() => toggleTodo(t.id)}
-                      aria-label={`${t.text} を完了にする`}
-                    />
-                    <span className="checkbox" aria-hidden="true" />
-                    <span className="item-text">{t.text}</span>
-                  </label>
-                  <button
-                    className="delete"
-                    onClick={() => deleteTodo(t.id)}
-                    aria-label={`${t.text} を削除`}
-                    title="削除"
-                  >
-                    削除
-                  </button>
-                </li>
+                <TodoItem
+                  key={t.id}
+                  todo={t}
+                  categories={categories}
+                  onToggle={toggleTodo}
+                  onDelete={deleteTodo}
+                  onSave={saveTodo}
+                  onAddSubtask={addSubtask}
+                  onToggleSubtask={toggleSubtask}
+                  onDeleteSubtask={deleteSubtask}
+                />
               ))}
             </ul>
           )}
@@ -227,8 +323,10 @@ function EmptyState({ todosLength, filter }) {
     message = "まだタスクがありません。上の入力欄から追加しましょう。";
   } else if (filter === "active") {
     message = "未完了のタスクはありません。ひと段落ですね。";
-  } else {
+  } else if (filter === "completed") {
     message = "完了したタスクはまだありません。";
+  } else {
+    message = "条件に一致するタスクがありません。";
   }
   return (
     <div className="empty">
